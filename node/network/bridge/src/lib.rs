@@ -23,7 +23,6 @@
 use parity_scale_codec::{Encode, Decode};
 use parking_lot::Mutex;
 use futures::prelude::*;
-use futures::channel::mpsc;
 use futures::stream::BoxStream;
 use sc_network::Event as NetworkEvent;
 use sp_consensus::SyncOracle;
@@ -37,7 +36,7 @@ use polkadot_subsystem::messages::{
 	NetworkBridgeMessage, AllMessages,
 	CollatorProtocolMessage, NetworkBridgeEvent,
 };
-use polkadot_primitives::v1::{Hash, BlockNumber, AuthorityDiscoveryId};
+use polkadot_primitives::v1::{Hash, BlockNumber};
 use polkadot_node_network_protocol::{
 	PeerId, peer_set::PeerSet, View, v1 as protocol_v1, OurView, UnifiedReputationChange as Rep,
 	ObservedRole,
@@ -319,12 +318,6 @@ impl From<SubsystemError> for UnexpectedAbort {
 	}
 }
 
-// notifications to be passed through to the validator discovery worker.
-enum ValidatorDiscoveryNotification {
-	PeerConnected(PeerId, PeerSet, Option<AuthorityDiscoveryId>),
-	PeerDisconnected(PeerId, PeerSet),
-}
-
 #[derive(Default, Clone)]
 struct Shared(Arc<Mutex<SharedInner>>);
 
@@ -344,7 +337,6 @@ async fn handle_subsystem_messages<Context, N, AD>(
 	mut ctx: Context,
 	mut network_service: N,
 	mut authority_discovery_service: AD,
-	validator_discovery_notifications: mpsc::Receiver<ValidatorDiscoveryNotification>,
 	shared: Shared,
 	sync_oracle: Box<dyn SyncOracle + Send>,
 	metrics: Metrics,
@@ -360,8 +352,6 @@ where
 	let mut validator_discovery = validator_discovery::Service::<N, AD>::new();
 
 	let mut mode = Mode::Syncing(sync_oracle);
-
-	let mut validator_discovery_notifications = validator_discovery_notifications.fuse();
 
 	loop {
 		futures::select! {
@@ -519,7 +509,7 @@ where
 					NetworkBridgeMessage::ConnectToValidators {
 						validator_ids,
 						peer_set,
-						connected,
+						failed,
 					} => {
 						tracing::trace!(
 							target: LOG_TARGET,
@@ -532,7 +522,7 @@ where
 						let (ns, ads) = validator_discovery.on_request(
 							validator_ids,
 							peer_set,
-							connected,
+							failed,
 							network_service,
 							authority_discovery_service,
 						).await;
@@ -542,19 +532,6 @@ where
 					}
 				}
 				Err(e) => return Err(e.into()),
-			},
-			notification = validator_discovery_notifications.next().fuse() => match notification {
-				None => return Ok(()),
-				Some(ValidatorDiscoveryNotification::PeerConnected(peer, peer_set, maybe_auth)) => {
-					validator_discovery.on_peer_connected(
-						peer.clone(),
-						peer_set,
-						maybe_auth,
-					).await;
-				}
-				Some(ValidatorDiscoveryNotification::PeerDisconnected(peer, peer_set)) => {
-					validator_discovery.on_peer_disconnected(&peer, peer_set);
-				}
 			},
 		}
 	}
@@ -566,7 +543,6 @@ async fn handle_network_messages<AD: validator_discovery::AuthorityDiscovery>(
 	mut network_stream: BoxStream<'static, NetworkEvent>,
 	mut authority_discovery_service: AD,
 	mut request_multiplexer: RequestMultiplexer,
-	mut validator_discovery_notifications: mpsc::Sender<ValidatorDiscoveryNotification>,
 	metrics: Metrics,
 	shared: Shared,
 ) -> Result<(), UnexpectedAbort> {
@@ -615,13 +591,6 @@ async fn handle_network_messages<AD: validator_discovery::AuthorityDiscovery>(
 					let maybe_authority =
 						authority_discovery_service
 							.get_authority_id_by_peer_id(peer).await;
-
-					// Failure here means that the other side of the network bridge
-					// has concluded and this future will be dropped in due course.
-					let _ = validator_discovery_notifications.send(
-						ValidatorDiscoveryNotification::PeerConnected(peer, peer_set, maybe_authority.clone())
-					).await;
-
 
 					match peer_set {
 						PeerSet::Validation => {
@@ -697,12 +666,6 @@ async fn handle_network_messages<AD: validator_discovery::AuthorityDiscovery>(
 
 						w
 					};
-
-					// Failure here means that the other side of the network bridge
-					// has concluded and this future will be dropped in due course.
-					let _ = validator_discovery_notifications.send(
-						ValidatorDiscoveryNotification::PeerDisconnected(peer.clone(), peer_set)
-					).await;
 
 					if was_connected {
 						match peer_set {
@@ -863,15 +826,12 @@ where
 		.get_statement_fetching()
 		.expect("Gets initialized, must be `Some` on startup. qed.");
 
-	 let (validation_worker_tx, validation_worker_rx) = mpsc::channel(1024);
-
 	let (remote, network_event_handler) = handle_network_messages(
 		ctx.sender().clone(),
 		network_service.clone(),
 		network_stream,
 		authority_discovery_service.clone(),
 		request_multiplexer,
-		validation_worker_tx,
 		metrics.clone(),
 		shared.clone(),
 	).remote_handle();
@@ -886,7 +846,6 @@ where
 		ctx,
 		network_service,
 		authority_discovery_service,
-		validation_worker_rx,
 		shared,
 		sync_oracle,
 		metrics,
